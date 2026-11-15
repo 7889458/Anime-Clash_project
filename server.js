@@ -1,71 +1,57 @@
-// Anime Clash online server - Low-Latency Optimized
-const http = require('http');
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-
-const PORT = +process.env.PORT || 8080;
-const MAX = 4;
-const FILE = path.join(__dirname, 'leaderboard.json');
+// Anime Clash online server - no dependencies. Run: node server.js
+const http = require('http'), crypto = require('crypto'), fs = require('fs'), path = require('path'), os = require('os');
+const PORT = +process.env.PORT || 8080, MAX = 4, FILE = path.join(__dirname, 'leaderboard.json');
 
 let lb = {};
 try { lb = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch (e) {}
 
-// Debounced async leaderboard save so disk I/O never stalls the network loop
 let saveTimer = null;
 const saveLB = () => {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
     fs.writeFile(FILE, JSON.stringify(lb), () => {});
-  }, 1500);
+  }, 1000);
 };
 
 const players = new Map();
-let queue = [];
-let mid = 0;
+let queue = [], mid = 0;
 
 const names = () => [...players.values()].map(p => p.n);
 const top = () => Object.values(lb).sort((a, b) => b.elo - a.elo).slice(0, 10);
 
-// Fast WebSocket frame builder
-function encodeFrame(str) {
-  const d = Buffer.from(str);
-  const n = d.length;
-  let h;
-  if (n < 126) {
-    h = Buffer.from([0x81, n]);
-  } else if (n < 65536) {
-    h = Buffer.allocUnsafe(4);
-    h[0] = 0x81;
-    h[1] = 126;
-    h.writeUInt16BE(n, 2);
-  } else {
-    h = Buffer.allocUnsafe(10);
-    h[0] = 0x81;
-    h[1] = 127;
-    h.writeBigUInt64BE(BigInt(n), 2);
-  }
-  return Buffer.concat([h, d]);
-}
-
 function sendRaw(c, buf) {
-  if (!c || c.sock.destroyed || !c.sock.writable) return;
-  try {
-    c.sock.write(buf);
-  } catch (e) {
-    drop(c);
-  }
+  if (!c || c.sock.destroyed) return;
+  try { c.sock.write(buf); } catch (e) { drop(c); }
 }
 
 function send(c, o) {
-  sendRaw(c, encodeFrame(JSON.stringify(o)));
+  const d = Buffer.from(JSON.stringify(o)), n = d.length;
+  let h;
+  if (n < 126) {
+    h = Buffer.from([0x81, n]);
+  } else {
+    h = Buffer.alloc(4);
+    h[0] = 0x81;
+    h[1] = 126;
+    h.writeUInt16BE(n, 2);
+  }
+  sendRaw(c, Buffer.concat([h, d]));
 }
 
 const bcast = o => {
-  const buf = encodeFrame(JSON.stringify(o));
-  for (const p of players.values()) sendRaw(p.c, buf);
+  const d = Buffer.from(JSON.stringify(o)), n = d.length;
+  let h;
+  if (n < 126) {
+    h = Buffer.from([0x81, n]);
+  } else {
+    h = Buffer.alloc(4);
+    h[0] = 0x81;
+    h[1] = 126;
+    h.writeUInt16BE(n, 2);
+  }
+  const frame = Buffer.concat([h, d]);
+  for (const p of players.values()) sendRaw(p.c, frame);
 };
 
 const busy = p => p.match && !p.match.done;
@@ -112,41 +98,17 @@ function leave(p) {
   p.match = null;
 }
 
-// Fast-path relay for real-time combat packets without JSON.parse overhead
-function fastRelay(c, rawStr) {
-  const p = c.p;
-  if (!p || !p.match) return false;
-  // Check for high-frequency combat types: "in", "sync", "pick", "start"
-  if (
-    rawStr.startsWith('{"t":"in"') ||
-    rawStr.startsWith('{"t":"sync"') ||
-    rawStr.startsWith('{"t":"pick"') ||
-    rawStr.startsWith('{"t":"start"')
-  ) {
-    const o = other(p);
-    if (o) sendRaw(o.c, encodeFrame(rawStr));
-    return true;
-  }
-  return false;
-}
-
 function handle(c, s) {
-  // Zero-parse fast relay for combat inputs & state sync
-  if (fastRelay(c, s)) return;
-
   let m;
   try { m = JSON.parse(s); } catch (e) { return; }
   let p = c.p;
 
-  if (m.t === 'ping') {
-    return send(c, { t: 'pong', ts: m.ts });
-  }
-
-  if (m.t === 'hello') {
+  if (m.t == 'hello') {
     if (p) return;
     const n = String(m.name || '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 12);
     if (!n) return send(c, { t: 'err', m: 'Bad username' });
 
+    // Kick any ghost session immediately
     const old = players.get(n.toLowerCase());
     if (old) {
       drop(old.c);
@@ -180,10 +142,7 @@ function handle(c, s) {
       startMatch(T, p);
       break;
     case 'dec':
-      if (T) {
-        T.chal = null;
-        send(T.c, { t: 'declined', by: p.n });
-      }
+      if (T) { T.chal = null; send(T.c, { t: 'declined', by: p.n }); }
       break;
     case 'q': {
       if (busy(p) || queue.includes(p)) return;
@@ -200,7 +159,7 @@ function handle(c, s) {
     case 'in':
     case 'sync': {
       const o = other(p);
-      if (o) sendRaw(o.c, encodeFrame(s));
+      if (o) send(o.c, m);
       break;
     }
     case 'res':
@@ -234,11 +193,11 @@ function parse(c) {
     const b = c.buf;
     if (b.length < 2) return;
     let len = b[1] & 127, off = 2;
-    if (len === 126) {
+    if (len == 126) {
       if (b.length < 4) return;
       len = b.readUInt16BE(2);
       off = 4;
-    } else if (len === 127) {
+    } else if (len == 127) {
       if (b.length < 10) return;
       len = Number(b.readBigUInt64BE(2));
       off = 10;
@@ -248,8 +207,7 @@ function parse(c) {
     if (mk) off += 4;
     if (b.length < off + len) return;
 
-    let d = Buffer.allocUnsafe(len);
-    b.copy(d, 0, off, off + len);
+    let d = Buffer.from(b.subarray(off, off + len));
     if (mk) {
       const k = b.subarray(off - 4, off);
       for (let i = 0; i < d.length; i++) d[i] ^= k[i & 3];
@@ -259,26 +217,26 @@ function parse(c) {
     c.buf = b.subarray(off + len);
     c.alive = true;
 
-    if (op === 8) {
+    if (op == 8) {
       drop(c);
       c.sock.destroy();
       return;
-    } else if (op === 9) {
+    } else if (op == 9) {
       sendRaw(c, Buffer.concat([Buffer.from([0x8a, d.length]), d]));
-    } else if (op === 10) {
-      c.alive = true;
-    } else if (op === 1) {
+    } else if (op == 10) {
+      // Pong received
+    } else if (op == 1) {
       handle(c, d.toString());
     }
   }
 }
 
-const clients = new Set();
-
 const server = http.createServer((q, r) => {
-  r.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
-  r.end('Anime Clash server running. Online: ' + players.size + '/' + MAX);
+  r.writeHead(200, { 'Content-Type': 'text/plain' });
+  r.end('Anime Clash server is running. Players online: ' + players.size + '/' + MAX);
 });
+
+const clients = new Set();
 
 server.on('upgrade', (req, sock) => {
   const key = req.headers['sec-websocket-key'];
@@ -287,9 +245,7 @@ server.on('upgrade', (req, sock) => {
     'HTTP/1.1 101 Switching Protocols\r\n' +
     'Upgrade: websocket\r\n' +
     'Connection: Upgrade\r\n' +
-    'Sec-WebSocket-Accept: ' +
-    crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64') +
-    '\r\n\r\n'
+    'Sec-WebSocket-Accept: ' + crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64') + '\r\n\r\n'
   );
   sock.setNoDelay(true);
   sock.setKeepAlive(true, 10000);
@@ -298,7 +254,7 @@ server.on('upgrade', (req, sock) => {
   clients.add(c);
 
   sock.on('data', d => {
-    c.buf = c.buf.length ? Buffer.concat([c.buf, d]) : d;
+    c.buf = Buffer.concat([c.buf, d]);
     parse(c);
   });
   sock.on('close', () => { clients.delete(c); drop(c); });
@@ -306,9 +262,8 @@ server.on('upgrade', (req, sock) => {
   sock.on('error', () => { clients.delete(c); drop(c); sock.destroy(); });
 });
 
-// 15-second heartbeat ping prevents Render proxy idle drops and cleans dead sockets
+// Keep Render proxy awake and sweep dead sockets every 15s
 setInterval(() => {
-  const pingFrame = Buffer.from([0x89, 0x00]);
   for (const c of clients) {
     if (!c.alive) {
       clients.delete(c);
@@ -317,10 +272,10 @@ setInterval(() => {
       continue;
     }
     c.alive = false;
-    sendRaw(c, pingFrame);
+    sendRaw(c, Buffer.from([0x89, 0x00])); // WebSocket Ping
   }
 }, 15000);
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('Anime Clash optimized server running on port ' + PORT);
+  console.log('Anime Clash server running (max ' + MAX + ' players) on port ' + PORT);
 });
