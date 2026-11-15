@@ -34,19 +34,24 @@ case 'unq':queue=queue.filter(q=>q!==p);break;
 case 'pick':case 'start':case 'in':case 'sync':{const o=other(p);if(o)send(o.c,m);break}
 case 'res':if(p.match&&!p.match.done)result(p.match,m.w==1?1:0);break;
 case 'leave':leave(p);break;
+case 'disconnect':drop(c);try{c.sock.end()}catch(e){}break;
 case 'lb':send(c,{t:'lb',rows:top()});break}}
-function drop(c){const p=c.p;if(!p)return;c.p=null;leave(p);players.delete(p.n.toLowerCase());queue=queue.filter(q=>q!==p);bcast({t:'online',list:names()})}
+
+function drop(c){const p=c.p;if(!p)return;c.p=null;leave(p);players.delete(p.n.toLowerCase());queue=queue.filter(q=>q!==p);if(p.chal){const target=p.chal;p.chal=null;if(target.chal===p)target.chal=null;send(target.c,{t:'cancel',from:p.n})}for(const other of players.values())if(other.chal===p)other.chal=null;bcast({t:'online',list:names()})}
+
 function parse(c){for(;;){const b=c.buf;if(b.length<2)return;let len=b[1]&127,off=2;
 if(len==126){if(b.length<4)return;len=b.readUInt16BE(2);off=4}else if(len==127){if(b.length<10)return;len=Number(b.readBigUInt64BE(2));off=10}
 if(len>1e6)return c.sock.destroy();const mk=b[1]&128;if(mk)off+=4;if(b.length<off+len)return;
 let d=Buffer.from(b.subarray(off,off+len));if(mk){const k=b.subarray(off-4,off);for(let i=0;i<d.length;i++)d[i]^=k[i&3]}
 const op=b[0]&15;c.buf=b.subarray(off+len);
-if(op==8){c.sock.end();return}else if(op==9){c.sock.write(Buffer.concat([Buffer.from([0x8a,d.length]),d]))}else if(op==1)handle(c,d.toString())}}
+if(op==8){drop(c);c.sock.end();return}else if(op==9){c.sock.write(Buffer.concat([Buffer.from([0x8a,d.length]),d]))}else if(op==1)handle(c,d.toString())}}
+
 const server=http.createServer((q,r)=>r.end('Anime Clash server is running. Players online: '+players.size+'/'+MAX));
 server.on('upgrade',(req,sock)=>{const key=req.headers['sec-websocket-key'];if(!key)return sock.destroy();
 sock.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '+crypto.createHash('sha1').update(key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')+'\r\n\r\n');
 sock.setNoDelay(true);const c={sock,buf:Buffer.alloc(0),p:null};
 sock.on('data',d=>{c.buf=Buffer.concat([c.buf,d]);parse(c)});sock.on('close',()=>drop(c));sock.on('error',()=>sock.destroy())});
+
 server.listen(PORT,'0.0.0.0',()=>{console.log('Anime Clash server running (max '+MAX+' players).\nConnect from the game with:');
 console.log('  this PC:      ws://localhost:'+PORT);
 for(const l of Object.values(os.networkInterfaces()))for(const i of l)if(i.family=='IPv4'&&!i.internal)console.log('  same network: ws://'+i.address+':'+PORT);
