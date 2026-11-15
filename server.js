@@ -1,4 +1,4 @@
-// Anime Clash online server - no dependencies. Run: node server.js (optional: PORT=9000 node server.js)
+// Anime Clash online server - Low-Latency Optimized
 const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -11,7 +11,16 @@ const FILE = path.join(__dirname, 'leaderboard.json');
 
 let lb = {};
 try { lb = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch (e) {}
-const saveLB = () => fs.writeFile(FILE, JSON.stringify(lb), () => {});
+
+// Debounced async leaderboard save so disk I/O never stalls the network loop
+let saveTimer = null;
+const saveLB = () => {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    fs.writeFile(FILE, JSON.stringify(lb), () => {});
+  }, 1500);
+};
 
 const players = new Map();
 let queue = [];
@@ -20,27 +29,43 @@ let mid = 0;
 const names = () => [...players.values()].map(p => p.n);
 const top = () => Object.values(lb).sort((a, b) => b.elo - a.elo).slice(0, 10);
 
-function send(c, o) {
-  const d = Buffer.from(JSON.stringify(o));
+// Fast WebSocket frame builder
+function encodeFrame(str) {
+  const d = Buffer.from(str);
   const n = d.length;
   let h;
   if (n < 126) {
     h = Buffer.from([0x81, n]);
-  } else {
-    h = Buffer.alloc(4);
+  } else if (n < 65536) {
+    h = Buffer.allocUnsafe(4);
     h[0] = 0x81;
     h[1] = 126;
     h.writeUInt16BE(n, 2);
+  } else {
+    h = Buffer.allocUnsafe(10);
+    h[0] = 0x81;
+    h[1] = 127;
+    h.writeBigUInt64BE(BigInt(n), 2);
   }
+  return Buffer.concat([h, d]);
+}
+
+function sendRaw(c, buf) {
+  if (!c || c.sock.destroyed || !c.sock.writable) return;
   try {
-    c.sock.write(Buffer.concat([h, d]));
+    c.sock.write(buf);
   } catch (e) {
     drop(c);
   }
 }
 
+function send(c, o) {
+  sendRaw(c, encodeFrame(JSON.stringify(o)));
+}
+
 const bcast = o => {
-  for (const p of players.values()) send(p.c, o);
+  const buf = encodeFrame(JSON.stringify(o));
+  for (const p of players.values()) sendRaw(p.c, buf);
 };
 
 const busy = p => p.match && !p.match.done;
@@ -56,8 +81,7 @@ function startMatch(a, b) {
 }
 
 function record(w, l) {
-  const kw = w.toLowerCase();
-  const kl = l.toLowerCase();
+  const kw = w.toLowerCase(), kl = l.toLowerCase();
   const a = lb[kw] = lb[kw] || { n: w, elo: 1000, w: 0, l: 0 };
   const b = lb[kl] = lb[kl] || { n: l, elo: 1000, w: 0, l: 0 };
   const e = 1 / (1 + Math.pow(10, (b.elo - a.elo) / 400));
@@ -72,7 +96,8 @@ function result(m, w) {
   if (m.done) return;
   m.done = true;
   record(m.p[w].n, m.p[1 - w].n);
-  for (const q of m.p) send(q.c, { t: 'lb', rows: top() });
+  const rows = top();
+  for (const q of m.p) send(q.c, { t: 'lb', rows });
 }
 
 function leave(p) {
@@ -87,17 +112,41 @@ function leave(p) {
   p.match = null;
 }
 
+// Fast-path relay for real-time combat packets without JSON.parse overhead
+function fastRelay(c, rawStr) {
+  const p = c.p;
+  if (!p || !p.match) return false;
+  // Check for high-frequency combat types: "in", "sync", "pick", "start"
+  if (
+    rawStr.startsWith('{"t":"in"') ||
+    rawStr.startsWith('{"t":"sync"') ||
+    rawStr.startsWith('{"t":"pick"') ||
+    rawStr.startsWith('{"t":"start"')
+  ) {
+    const o = other(p);
+    if (o) sendRaw(o.c, encodeFrame(rawStr));
+    return true;
+  }
+  return false;
+}
+
 function handle(c, s) {
+  // Zero-parse fast relay for combat inputs & state sync
+  if (fastRelay(c, s)) return;
+
   let m;
   try { m = JSON.parse(s); } catch (e) { return; }
   let p = c.p;
+
+  if (m.t === 'ping') {
+    return send(c, { t: 'pong', ts: m.ts });
+  }
 
   if (m.t === 'hello') {
     if (p) return;
     const n = String(m.name || '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 12);
     if (!n) return send(c, { t: 'err', m: 'Bad username' });
 
-    // Instantly drop any ghost/old connection with the same username
     const old = players.get(n.toLowerCase());
     if (old) {
       drop(old.c);
@@ -105,7 +154,6 @@ function handle(c, s) {
     }
 
     if (players.size >= MAX) return send(c, { t: 'err', m: 'Server full (max ' + MAX + ' players)' });
-
     p = c.p = { n, c, match: null, chal: null };
     players.set(n.toLowerCase(), p);
     send(c, { t: 'welcome', online: names() });
@@ -114,7 +162,6 @@ function handle(c, s) {
   }
 
   if (!p) return;
-
   const T = m.to || m.from ? players.get(String(m.to || m.from).toLowerCase()) : null;
 
   switch (m.t) {
@@ -153,7 +200,7 @@ function handle(c, s) {
     case 'in':
     case 'sync': {
       const o = other(p);
-      if (o) send(o.c, m);
+      if (o) sendRaw(o.c, encodeFrame(s));
       break;
     }
     case 'res':
@@ -186,8 +233,7 @@ function parse(c) {
   for (;;) {
     const b = c.buf;
     if (b.length < 2) return;
-    let len = b[1] & 127;
-    let off = 2;
+    let len = b[1] & 127, off = 2;
     if (len === 126) {
       if (b.length < 4) return;
       len = b.readUInt16BE(2);
@@ -201,28 +247,37 @@ function parse(c) {
     const mk = b[1] & 128;
     if (mk) off += 4;
     if (b.length < off + len) return;
-    let d = Buffer.from(b.subarray(off, off + len));
+
+    let d = Buffer.allocUnsafe(len);
+    b.copy(d, 0, off, off + len);
     if (mk) {
       const k = b.subarray(off - 4, off);
       for (let i = 0; i < d.length; i++) d[i] ^= k[i & 3];
     }
+
     const op = b[0] & 15;
     c.buf = b.subarray(off + len);
+    c.alive = true;
+
     if (op === 8) {
       drop(c);
       c.sock.destroy();
       return;
     } else if (op === 9) {
-      c.sock.write(Buffer.concat([Buffer.from([0x8a, d.length]), d]));
+      sendRaw(c, Buffer.concat([Buffer.from([0x8a, d.length]), d]));
+    } else if (op === 10) {
+      c.alive = true;
     } else if (op === 1) {
       handle(c, d.toString());
     }
   }
 }
 
+const clients = new Set();
+
 const server = http.createServer((q, r) => {
-  r.writeHead(200, { 'Content-Type': 'text/plain' });
-  r.end('Anime Clash server is running. Players online: ' + players.size + '/' + MAX);
+  r.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+  r.end('Anime Clash server running. Online: ' + players.size + '/' + MAX);
 });
 
 server.on('upgrade', (req, sock) => {
@@ -237,27 +292,35 @@ server.on('upgrade', (req, sock) => {
     '\r\n\r\n'
   );
   sock.setNoDelay(true);
-  const c = { sock, buf: Buffer.alloc(0), p: null };
+  sock.setKeepAlive(true, 10000);
+
+  const c = { sock, buf: Buffer.alloc(0), p: null, alive: true };
+  clients.add(c);
+
   sock.on('data', d => {
-    c.buf = Buffer.concat([c.buf, d]);
+    c.buf = c.buf.length ? Buffer.concat([c.buf, d]) : d;
     parse(c);
   });
-  sock.on('close', () => drop(c));
-  sock.on('end', () => drop(c));
-  sock.on('error', () => {
-    drop(c);
-    sock.destroy();
-  });
+  sock.on('close', () => { clients.delete(c); drop(c); });
+  sock.on('end', () => { clients.delete(c); drop(c); });
+  sock.on('error', () => { clients.delete(c); drop(c); sock.destroy(); });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log('Anime Clash server running (max ' + MAX + ' players).\nConnect from the game with:');
-  console.log('  this PC:      ws://localhost:' + PORT);
-  for (const l of Object.values(os.networkInterfaces())) {
-    for (const i of l) {
-      if (i.family === 'IPv4' && !i.internal) {
-        console.log('  same network: ws://' + i.address + ':' + PORT);
-      }
+// 15-second heartbeat ping prevents Render proxy idle drops and cleans dead sockets
+setInterval(() => {
+  const pingFrame = Buffer.from([0x89, 0x00]);
+  for (const c of clients) {
+    if (!c.alive) {
+      clients.delete(c);
+      drop(c);
+      try { c.sock.destroy(); } catch (e) {}
+      continue;
     }
+    c.alive = false;
+    sendRaw(c, pingFrame);
   }
+}, 15000);
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log('Anime Clash optimized server running on port ' + PORT);
 });
