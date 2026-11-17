@@ -7,6 +7,9 @@ const os = require('os');
 
 const PORT = +process.env.PORT || 8080;
 const MAX = 4;
+// Admin key for giving fighters to online players. Set it on your host (e.g. Render env var ADMIN_KEY)
+// and use the same code in the game's admin console:  admin <code>
+const ADMIN_KEY = process.env.ADMIN_KEY || 'clash-admin';
 const FILE = path.join(__dirname, 'leaderboard.json');
 
 let lb = {};
@@ -24,6 +27,7 @@ const saveLB = () => {
 
 const players = new Map();
 let queue = [];
+let queue3 = []; // 3-player free-for-all queue
 let mid = 0;
 
 const names = () => [...players.values()].map(p => p.n);
@@ -70,14 +74,26 @@ const bcast = o => {
 
 const busy = p => p.match && !p.match.done;
 const other = p => p.match && p.match.p.find(q => q !== p);
+const others = p => (p.match ? p.match.p.filter(q => q !== p) : []);
 
 function startMatch(a, b) {
   const m = { id: ++mid, p: [a, b], done: false };
   a.match = b.match = m;
   a.chal = b.chal = null;
   queue = queue.filter(q => q !== a && q !== b);
+  queue3 = queue3.filter(q => q !== a && q !== b);
   send(a.c, { t: 'match', opp: b.n, slot: 0, id: m.id });
   send(b.c, { t: 'match', opp: a.n, slot: 1, id: m.id });
+}
+
+// 3-player free-for-all (casual: not ranked)
+function startMatch3(ps) {
+  const m = { id: ++mid, p: ps, done: false, ffa: true, slots: new Map() };
+  const names = ps.map(q => q.n);
+  ps.forEach((q, k) => { q.match = m; q.chal = null; m.slots.set(q, k); });
+  queue = queue.filter(q => !ps.includes(q));
+  queue3 = queue3.filter(q => !ps.includes(q));
+  ps.forEach((q, k) => send(q.c, { t: 'match', opp: names.filter((_, j) => j !== k).join(' & '), slot: k, id: m.id, np: 3, names }));
 }
 
 function record(w, l) {
@@ -103,6 +119,14 @@ function result(m, w) {
 function leave(p) {
   const m = p.match;
   if (!m) return;
+  if (m.ffa) {
+    const s = m.slots.get(p);
+    m.p = m.p.filter(q => q !== p);
+    for (const o of m.p) send(o.c, { t: 'opp_left', s, who: p.n });
+    if (m.p.length <= 1) { m.done = true; for (const o of m.p) if (o.match === m) o.match = null; }
+    p.match = null;
+    return;
+  }
   const o = other(p);
   if (!m.done && o) result(m, m.p.indexOf(o));
   if (o) {
@@ -123,8 +147,8 @@ function fastRelay(c, rawStr) {
     rawStr.startsWith('{"t":"pick"') ||
     rawStr.startsWith('{"t":"start"')
   ) {
-    const o = other(p);
-    if (o) sendRaw(o.c, encodeFrame(rawStr));
+    const buf = encodeFrame(rawStr);
+    for (const o of others(p)) sendRaw(o.c, buf);
     return true;
   }
   return false;
@@ -154,7 +178,7 @@ function handle(c, s) {
     }
 
     if (players.size >= MAX) return send(c, { t: 'err', m: 'Server full (max ' + MAX + ' players)' });
-    p = c.p = { n, c, match: null, chal: null };
+    p = c.p = { n, c, match: null, chal: null, admin: false, tries: 0 };
     players.set(n.toLowerCase(), p);
     send(c, { t: 'welcome', online: names() });
     bcast({ t: 'online', list: names() });
@@ -194,18 +218,27 @@ function handle(c, s) {
     }
     case 'unq':
       queue = queue.filter(q => q !== p);
+      queue3 = queue3.filter(q => q !== p);
+      for (const q of queue3) send(q.c, { t: 'q3n', n: queue3.length });
       break;
+    case 'q3': {
+      if (busy(p) || queue3.includes(p) || queue.includes(p)) return;
+      queue3.push(p);
+      if (queue3.length >= 3) startMatch3(queue3.splice(0, 3));
+      else for (const q of queue3) send(q.c, { t: 'q3n', n: queue3.length });
+      break;
+    }
     case 'pick':
     case 'start':
     case 'in':
     case 'rtc':
     case 'sync': {
-      const o = other(p);
-      if (o) sendRaw(o.c, encodeFrame(s));
+      const buf = encodeFrame(s);
+      for (const o of others(p)) sendRaw(o.c, buf);
       break;
     }
     case 'res':
-      if (p.match && !p.match.done) result(p.match, m.w == 1 ? 1 : 0);
+      if (p.match && !p.match.done && !p.match.ffa) result(p.match, m.w == 1 ? 1 : 0);
       break;
     case 'leave':
       leave(p);
@@ -217,6 +250,20 @@ function handle(c, s) {
     case 'lb':
       send(c, { t: 'lb', rows: top() });
       break;
+    case 'admin':
+      if (p.tries >= 5) return send(c, { t: 'adm', m: 'Too many wrong admin codes - reconnect to try again' });
+      p.admin = String(m.key || '') === ADMIN_KEY;
+      if (!p.admin) p.tries++;
+      send(c, { t: 'adm', m: p.admin ? 'Admin OK - you can give fighters to online players' : 'Server rejected the admin code (check ADMIN_KEY on the server)' });
+      break;
+    case 'give': {
+      if (!p.admin) return send(c, { t: 'adm', m: 'Not admin on this server' });
+      if (!T) return send(c, { t: 'adm', m: 'Player "' + m.to + '" is not online' });
+      const ids = (Array.isArray(m.c) ? m.c : []).map(String).filter(id => /^[a-z0-9]{1,16}$/.test(id)).slice(0, 20);
+      send(T.c, { t: 'gift', c: ids, by: p.n, take: !!m.take });
+      send(c, { t: 'adm', m: (m.take ? 'Removed ' : 'Gave ') + ids.join(', ') + (m.take ? ' from ' : ' to ') + T.n });
+      break;
+    }
   }
 }
 
@@ -227,6 +274,7 @@ function drop(c) {
   leave(p);
   players.delete(p.n.toLowerCase());
   queue = queue.filter(q => q !== p);
+  if (queue3.includes(p)) { queue3 = queue3.filter(q => q !== p); for (const q of queue3) send(q.c, { t: 'q3n', n: queue3.length }); }
   bcast({ t: 'online', list: names() });
 }
 
