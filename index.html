@@ -131,15 +131,15 @@ KIT.push(...[
 {jmp:1.08,grav:.27,p:'VAMPIRE · HEALS 15% OF DAMAGE DEALT · MOVES 1s IN STOPPED TIME'},
 {spd:1.66,p:'ULT HEALS 30 + TURNS FOE TO ROCK · TAKE 80 DMG: HAIR RAGE (+20% DMG)'},
 {dcd:34,p:'J PLANTS A BOMB, K BLOWS IT UP ANYWHERE · ULT REWINDS YOUR HP 5s'},
-{spd:1.6,chg:.85,uc:400,mx:400,p:'ULT COSTS 400 MP (15% SLOWER MANA) → REQUIEM: 90% LESS DMG, NO KNOCKBACK'},
+{spd:1.6,chg:1.5,uc:400,mx:400,p:'TAKES 25% LESS DMG · MANA 50% FASTER · ULT 400 MP → REQUIEM: 95% LESS DMG'},
 {jmp:1.04,acc:.18,p:'STITCH UP · SURVIVES ONE KNOCKOUT WITH 15 HP (ONCE PER ROUND)'},
-{spd:1.6,p:'FIND THE GREEN BABY → C-MOON → AT A RANDOM MOMENT: MADE IN HEAVEN'},
+{spd:1.6,p:'GREEN BABY → C-MOON → RANDOMLY: MADE IN HEAVEN (UNIVERSE RESET: 40 MP)'},
 {spd:1.6,p:'STARTS AS DOPPIO · SURVIVE 20s → DIAVOLO (EPITAPH DODGE EVERY 12s)'},
 {spd:1.6,p:'HUMAN · SPILL 50 DMG OF BLOOD OR USE ULT → STONE MASK → VAMPIRE'},
 {spd:1.6,p:'FIND THE RED STONE OF AJA → ULTIMATE LIFEFORM (FLIES, REGENERATES)'}
 ].map(k=>({...KD,...k})));
 /* stats for the evolved forms (KITF) and for temporary buffs (JBF: Joseph running away, Josuke's hair rage) */
-const KITF={19:[{chg:.85,spd:1.72,uc:100,mx:100,kbm:.15}],21:[{grav:.24,jmp:1.1,spd:1.7},{spd:2.6,air:3.2,acc:.3,dcd:12,dsp:1.4,chg:1.6}],22:[{kbm:.88,dsp:1.15,spd:1.72}],23:[{jmp:1.12,spd:1.75,kbm:.9}],24:[{jumps:3,air:2.6,grav:.24,kbm:.9,spd:1.7}]},JBF={14:{spd:2.5,air:3,dcd:8,dsp:1.3},17:{spd:1.9}};
+const KITF={19:[{chg:1.5,spd:1.72,uc:100,mx:100,kbm:.15}],21:[{grav:.24,jmp:1.1,spd:1.7},{spd:2.6,air:3.2,acc:.3,dcd:12,dsp:1.4,chg:1.6,uc:40}],22:[{kbm:.88,dsp:1.15,spd:1.72}],23:[{jmp:1.12,spd:1.75,kbm:.9}],24:[{jumps:3,air:2.6,grav:.24,kbm:.9,spd:1.7}]},JBF={14:{spd:2.5,air:3,dcd:8,dsp:1.3},17:{spd:1.9}};
 for(const c in KITF)KITF[c]=KITF[c].map(k=>({...KIT[c],...k}));for(const c in JBF)JBF[c]={...KIT[c],...JBF[c]};
 const kt=f=>f.bf>0&&JBF[f.ch]?JBF[f.ch]:f.fm&&KITF[f.ch]?KITF[f.ch][f.fm-1]:KIT[f.ch];
 U.push({hits:[50],fin:56,end:84},{hits:[44,48,52,56,60,64,68,72],fin:84,end:108},{hits:[],fin:12,end:16},{hits:[54,58,62,66,70,74,78,82,86,90,94],fin:104,end:130},
@@ -432,7 +432,7 @@ function jjDodge(o,f){if(o===f||o.ch!=22||o.fm!=1||o.epc>0||o.st=='ult'||o.st=='
 function jjDm(o,f,dm){let k=1;const c=f.ch,m=f.fm||0;
  if(c==13&&f.zw)k*=1.1;if(c==17&&f.bf>0)k*=1.2;if(c==19&&m)k*=1.2;if(c==21&&m==2)k*=1.15;if(c==22)k*=m?1.1:.85;if(c==23)k*=m?1.05:.85;if(c==24&&m)k*=1.1;
  if((c==13||c==14)&&(o.ch==16||(o.ch==23&&o.fm)||(o.ch==24&&!o.fm))){k*=1.3;burst(o.x,o.y-18,6,['#ffe36b','#fff'],2,10)}
- if(G.tst>0&&f.i===G.tso)k*=.6;if(o.ch==19&&o.fm==1)k*=.1;
+ if(G.tst>0&&f.i===G.tso)k*=.6;if(o.ch==19)k*=o.fm==1?.05:.75;
  return Math.max(1,Math.round(dm*k))}
 function jjAfter(o,f,dm){
  if(f!==o){if(f.ch==16||(f.ch==23&&f.fm))f.hp=Math.min(f.hm,f.hp+dm*(f.ch==16?.15:.2));
@@ -664,7 +664,7 @@ function jjGim(f){const c=f.ch,s=n=>Math.ceil(n/60)+'s';
   case 16:return['VAMPIRE: HEALS ON HIT','#ffd23f'];
   case 17:return f.bf>0?['HAIR RAGE! +20% DMG '+s(f.bf),'#ff8ad8']:f.g1?null:['HAIR RAGE '+Math.min(80,f.tk|0)+'/80','#c070a8'];
   case 18:return f.bm?['BOMB SET: K TO DETONATE','#ff9ad0']:['J: PLANT A BOMB','#c07898'];
-  case 19:return f.fm?['REQUIEM: VIRTUALLY INVINCIBLE'+(f.nlc>0?'':' · ULT SHIELD READY'),'#ffe36b']:['REQUIEM NEEDS 400 MP  ('+(f.mp|0)+')','#ffd23f'];
+  case 19:return f.fm?['REQUIEM: -95% DMG TAKEN'+(f.nlc>0?'':' · ULT SHIELD READY'),'#ffe36b']:['-25% DMG · REQUIEM NEEDS 400 MP ('+(f.mp|0)+')','#ffd23f'];
   case 20:return f.sv?null:['STITCH UP READY','#6fd0ff'];
   case 21:return f.fm==2?['MADE IN HEAVEN','#3fd0ff']:f.fm==1?['C-MOON · HEAVEN IS NEAR...','#3fd08a']:f.it?['GRAB THE GREEN BABY!','#5fe38a']:['GREEN BABY IN '+s(420-(f.gt||0)),'#7aa088'];
   case 22:return f.fm?['EPITAPH '+(f.epc>0?s(f.epc):'READY'),'#ff5a7a']:['DOPPIO · BOSS IN '+s(Math.max(0,1200-(f.gt||0))),'#ff9ad0'];
@@ -1227,7 +1227,7 @@ if(c.h&&!f.air){f.st='charge';f.vx=0;f.mp=Math.min(kt(f).mx,f.mp+.1875*kt(f).chg
 const KF=kt(f);if(f.air){f.vx=Math.max(-KF.air,Math.min(KF.air,f.vx+d*KF.acc))}else{f.vx=d*KF.spd;if(d)f.f=d}
 if(c.u&&f.j<KF.jumps){if(f.j==0){f.jy=f.y;f.jt=0}f.vy=(f.j?-4.7:-5.5)*KF.jmp;f.j++;f.air=1;burst(f.x,f.y,5,['#cdb8ff','#fff'],1.2,10)}
 else if(c.u&&f.air&&!f.rc&&!(f.rcd>0)){f.rc=1;f.rcd=RCD;f.vy=-6.4*KF.rjm;f.vx=d*2.6;f.j=KF.jumps;ring(f.x,f.y-16,22,CH[f.ch].col,12);burst(f.x,f.y-8,18,[CH[f.ch].col,'#fff'],2.5,16);txt('RECOVERY',f.x,f.y-40,CH[f.ch].col,7)}
-if(c.a){const tap=f.air&&c.uh&&f.j==1&&f.jt!=null&&f.jt<=9&&f.jy!=null;
+if(c.a){const tap=f.air&&c.uh&&f.j==1&&f.jt!=null&&f.jt<=3&&f.jy!=null;
  if(f.air&&!tap){f.mv=c.uh?'ua':c.d?'da':d==f.f?'fa':d==-f.f?'ba':'na';f.st='atk';f.t=0;f.hit=0}
  else{if(tap){f.y=f.jy;f.vy=0;f.air=0;f.j=0;f.jt=99}const tl=c.uh?'ut':c.d?'dt':d?'ft':null;if(tl){f.mv=tl;f.st='atk';f.t=0;f.hit=0;f.vx=0}else startMove(f,'a')}}else if(c.s){if(f.air){f.aim=c.uh?-1:c.d?1:0;if(d&&d!=f.f)f.f=d}else f.aim=0;startMove(f,'s')}else if(c.n&&!cut&&!F.some(q=>q.st=='ult'))startMove(f,'n')}
 function ai(f,o){if(!o)return{l:0,r:0,u:0,a:0,s:0,n:0,h:0,g:0};{const jr=jjAI(f,o);if(jr)return jr}
