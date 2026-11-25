@@ -6,7 +6,7 @@ const path = require('path');
 const os = require('os');
 
 const PORT = +process.env.PORT || 8080;
-const MAX = 4;
+const MAX = 30;
 const FILE = path.join(__dirname, 'leaderboard.json');
 
 let lb = {};
