@@ -6,7 +6,7 @@ const path = require('path');
 const os = require('os');
 
 const PORT = +process.env.PORT || 8080;
-const MAX = 4;
+const MAX = 30;
 // Admin key for giving fighters to online players. Set it on your host (e.g. Render env var ADMIN_KEY)
 // and use the same code in the game's admin console:  admin <code>
 const ADMIN_KEY = process.env.ADMIN_KEY || 'clash-admin';
