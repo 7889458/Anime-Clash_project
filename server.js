@@ -1,6 +1,6 @@
 // Anime Clash online server - low-latency relay
 // Supports: 1v1 ranked (queue + challenges, ELO leaderboard), 3-player free-for-all queue,
-// WebRTC signalling for 1v1 and 3-player matches, and admin unlock gifts.
+// private rooms (host settings, invites, ban list - unranked), WebRTC signalling and admin unlock gifts.
 //
 // Settings (environment variables, all optional):
 //   PORT        port to listen on (default 8080)
@@ -38,6 +38,7 @@ const players = new Map();
 let queue = [];   // waiting for a 1v1 ranked match
 let queue3 = [];  // waiting for a 3-player free-for-all
 let mid = 0;
+const rooms = new Map(); // code -> { code, host, ps:[players], set:{gm,rw,tm,st,ban}, game }
 
 const names = () => [...players.values()].map(p => p.n);
 const top = () => Object.values(lb).sort((a, b) => b.elo - a.elo).slice(0, 10);
@@ -103,21 +104,22 @@ const unqueue = p => {
 };
 const q3count = () => { for (const q of queue3) send(q.c, { t: 'q3n', n: queue3.length }); };
 
-function startMatch(a, b) {
-  const m = { id: ++mid, p: [a, b], np: 2, done: false };
+function startMatch(a, b, opt = { ranked: true }) {
+  const m = { id: ++mid, p: [a, b], np: 2, done: false, ranked: !!opt.ranked, room: opt.room || null, rs: opt.room ? opt.room.set : null };
   a.match = b.match = m;
   a.chal = b.chal = null;
   unqueue(a);
   unqueue(b);
-  send(a.c, { t: 'match', opp: b.n, slot: 0, id: m.id, np: 2, names: [a.n, b.n] });
-  send(b.c, { t: 'match', opp: a.n, slot: 1, id: m.id, np: 2, names: [a.n, b.n] });
+  const ex = { ranked: m.ranked, rs: m.rs, room: m.room && m.room.code };
+  send(a.c, { t: 'match', opp: b.n, slot: 0, id: m.id, np: 2, names: [a.n, b.n], ...ex });
+  send(b.c, { t: 'match', opp: a.n, slot: 1, id: m.id, np: 2, names: [a.n, b.n], ...ex });
 }
 
-function startMatch3(ps) {
-  const m = { id: ++mid, p: ps, np: 3, done: false };
+function startMatch3(ps, opt = {}) {
+  const m = { id: ++mid, p: ps, np: 3, done: false, ranked: false, room: opt.room || null, rs: opt.room ? opt.room.set : null };
   const nm = ps.map(q => q.n);
   ps.forEach(q => { q.match = m; q.chal = null; unqueue(q); });
-  ps.forEach((q, i) => send(q.c, { t: 'match', np: 3, slot: i, id: m.id, names: nm, opp: nm.filter((_, j) => j != i).join(' & ') }));
+  ps.forEach((q, i) => send(q.c, { t: 'match', np: 3, slot: i, id: m.id, names: nm, opp: nm.filter((_, j) => j != i).join(' & '), ranked: false, rs: m.rs, room: m.room && m.room.code }));
 }
 
 function record(w, l) {
@@ -132,11 +134,11 @@ function record(w, l) {
   saveLB();
 }
 
-/* only 1v1 matches are ranked; 3-player free-for-alls don't change ELO */
+/* only ranked 1v1 matches (queue / challenge) change ELO; rooms and 3-player free-for-alls don't */
 function result(m, w) {
   if (m.done) return;
   m.done = true;
-  if (m.np !== 2) return;
+  if (!m.ranked) return;
   record(m.p[w].n, m.p[1 - w].n);
   const rows = top();
   for (const q of m.p) send(q.c, { t: 'lb', rows });
@@ -149,13 +151,55 @@ function leave(p) {
   if (m.np === 2) {
     const o = os[0];
     if (!m.done && o) result(m, m.p.indexOf(o)); // leaving a ranked match = forfeit
-    if (o) send(o.c, { t: 'opp_left' });
+    if (o) {
+      send(o.c, { t: 'opp_left' });
+      if (o.match === m) o.match = null; // a 1v1 is over once either player leaves
+    }
   } else {
     m.done = true; // the game ends a 3-player match for everyone when someone leaves
     const s = m.p.indexOf(p);
     for (const q of os) send(q.c, { t: 'opp_left', s, who: p.n });
   }
   p.match = null;
+  roomMatchOver(m);
+}
+
+/* ---------- private rooms ---------- */
+const ROOM_MAX = 3;
+const roomState = r => ({ t: 'room', code: r.code, host: r.host.n, players: r.ps.map(q => q.n), set: r.set, game: r.game });
+const rsend = r => { const o = roomState(r); for (const q of r.ps) send(q.c, o); };
+function roomCode() {
+  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  for (;;) { let c = ''; for (let i = 0; i < 4; i++) c += A[Math.floor(Math.random() * A.length)]; if (!rooms.has(c)) return c; }
+}
+function roomLeave(p, why) {
+  const r = p.room;
+  if (!r) return;
+  r.ps = r.ps.filter(q => q !== p);
+  p.room = null;
+  if (why) send(p.c, { t: 'rleft', m: why });
+  if (!r.ps.length) { rooms.delete(r.code); return; }
+  if (r.host === p) r.host = r.ps[0];
+  rsend(r);
+}
+/* when everyone has left a room's match, the room is free again and everyone sees it */
+function roomMatchOver(m) {
+  const r = m.room;
+  if (!r || !r.game || m.p.some(q => q.match === m)) return;
+  r.game = false;
+  if (rooms.get(r.code) === r) rsend(r);
+}
+const clampSet = (v, ok, d) => (ok.includes(v) ? v : d);
+function cleanSet(s) {
+  s = s && typeof s === 'object' ? s : {};
+  const ban = Array.isArray(s.ban) ? [...new Set(s.ban.map(v => v | 0).filter(v => v >= 0 && v < 64))].slice(0, 40) : [];
+  return {
+    gm: s.gm === 'candle' ? 'candle' : '',
+    rw: clampSet(s.rw | 0, [1, 2, 3], 2),
+    tm: clampSet(s.tm | 0, [0, 60, 90, 120, 180], 0),
+    st: Math.max(-2, Math.min(15, Number.isInteger(s.st) ? s.st : -1)),
+    ban,
+  };
 }
 
 // Fast-path relay for real-time combat packets without JSON.parse overhead
@@ -169,7 +213,8 @@ function fastRelay(c, raw) {
   return false;
 }
 
-const ranked = p => p.match && p.match.np === 2;
+const ranked = p => !!(p.match && p.match.ranked);
+const roomBanned = (p, c) => !!(p.match && p.match.rs && p.match.rs.ban.includes(+c));
 
 function handle(c, s) {
   if (fastRelay(c, s)) return;
@@ -195,7 +240,7 @@ function handle(c, s) {
     }
 
     if (players.size >= MAX) return send(c, { t: 'err', m: 'Server full (max ' + MAX + ' players)' });
-    p = c.p = { n, c, match: null, chal: null, adm: false };
+    p = c.p = { n, c, match: null, chal: null, adm: false, room: null };
     players.set(n.toLowerCase(), p);
     send(c, { t: 'welcome', online: names() });
     bcast({ t: 'online', list: names() });
@@ -228,6 +273,7 @@ function handle(c, s) {
       }
       break;
     case 'q': {
+      if (p.room) return send(c, { t: 'err', m: 'Leave your room first' });
       if (busy(p) || queue.includes(p)) return;
       unqueue(p);
       const o = queue.find(q => q !== p);
@@ -236,6 +282,7 @@ function handle(c, s) {
       break;
     }
     case 'q3': {
+      if (p.room) return send(c, { t: 'err', m: 'Leave your room first' });
       if (busy(p) || queue3.includes(p)) return;
       unqueue(p);
       queue3.push(p);
@@ -249,11 +296,13 @@ function handle(c, s) {
     case 'pick':
       if (!p.match) return;
       if (ranked(p) && RANKED_BANNED.has(+m.c)) return send(c, { t: 'err', m: BAN_MSG });
+      if (roomBanned(p, m.c)) return send(c, { t: 'err', m: 'That fighter is banned in this room' });
       relay(p, s);
       break;
     case 'start':
       if (!p.match) return;
       if (ranked(p) && Array.isArray(m.c) && m.c.some(v => RANKED_BANNED.has(+v))) return send(c, { t: 'err', m: BAN_MSG });
+      if (Array.isArray(m.c) && m.c.some(v => roomBanned(p, v))) return send(c, { t: 'err', m: 'A banned fighter was picked' });
       relay(p, s);
       break;
     case 'rtc': {
@@ -277,6 +326,70 @@ function handle(c, s) {
     case 'lb':
       send(c, { t: 'lb', rows: top() });
       break;
+    /* ----- private rooms ----- */
+    case 'rcreate': {
+      if (busy(p)) return send(c, { t: 'err', m: 'Finish your match first' });
+      roomLeave(p);
+      unqueue(p);
+      const r = { code: roomCode(), host: p, ps: [p], set: cleanSet({}), game: false };
+      rooms.set(r.code, r);
+      p.room = r;
+      rsend(r);
+      break;
+    }
+    case 'rjoin': {
+      const r = rooms.get(String(m.code || '').toUpperCase().trim());
+      if (!r) return send(c, { t: 'err', m: 'No room with code "' + String(m.code || '').slice(0, 8) + '"' });
+      if (r === p.room) return rsend(r);
+      if (r.ps.length >= ROOM_MAX) return send(c, { t: 'err', m: 'That room is full (3 players)' });
+      if (r.game) return send(c, { t: 'err', m: 'That room is in a match - try again soon' });
+      if (busy(p)) return send(c, { t: 'err', m: 'Finish your match first' });
+      roomLeave(p);
+      unqueue(p);
+      r.ps.push(p);
+      p.room = r;
+      rsend(r);
+      break;
+    }
+    case 'rleave':
+      roomLeave(p);
+      break;
+    case 'rinv': {
+      const r = p.room;
+      if (!r) return;
+      const tg = players.get(String(m.to || '').toLowerCase());
+      if (!tg || tg === p) return send(c, { t: 'rmsg', m: 'Player "' + String(m.to || '').slice(0, 12) + '" is not online' });
+      if (r.ps.includes(tg)) return send(c, { t: 'rmsg', m: tg.n + ' is already in the room' });
+      send(tg.c, { t: 'rinv', from: p.n, code: r.code });
+      send(c, { t: 'rmsg', m: 'Invite sent to ' + tg.n });
+      break;
+    }
+    case 'rset': {
+      const r = p.room;
+      if (!r || r.host !== p || r.game) return;
+      r.set = cleanSet(m.set);
+      rsend(r);
+      break;
+    }
+    case 'rkick': {
+      const r = p.room;
+      if (!r || r.host !== p || r.game) return;
+      const tg = r.ps.find(q => q.n.toLowerCase() === String(m.name || '').toLowerCase());
+      if (tg && tg !== p) roomLeave(tg, 'You were removed from room ' + r.code);
+      break;
+    }
+    case 'rstart': {
+      const r = p.room;
+      if (!r || r.host !== p || r.game) return;
+      if (r.ps.length < 2) return send(c, { t: 'rmsg', m: 'You need at least 2 players' });
+      if (r.ps.some(q => busy(q))) return send(c, { t: 'rmsg', m: 'Someone is still in another match' });
+      r.game = true;
+      const ps = [r.host, ...r.ps.filter(q => q !== r.host)]; // the host is slot 0 (picks the stage)
+      if (ps.length === 2) startMatch(ps[0], ps[1], { ranked: false, room: r });
+      else startMatch3(ps.slice(0, 3), { room: r });
+      rsend(r);
+      break;
+    }
     case 'admin':
       p.adm = m.key === ADMIN_KEY;
       send(c, { t: 'adm', m: p.adm ? 'Admin ON on this server.' : 'Wrong admin code for this server.' });
@@ -299,6 +412,7 @@ function drop(c) {
   if (!p) return;
   c.p = null;
   leave(p);
+  roomLeave(p);
   players.delete(p.n.toLowerCase());
   unqueue(p);
   bcast({ t: 'online', list: names() });
