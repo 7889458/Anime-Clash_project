@@ -1,6 +1,6 @@
 // Anime Clash online server - low-latency relay
 // Supports: 1v1 ranked (queue + challenges, ELO leaderboard), 3-player free-for-all queue,
-// private rooms (host settings, invites, ban list - unranked), WebRTC signalling and admin unlock gifts.
+// private rooms of up to 4 (host settings, invites, ban list - unranked), WebRTC signalling and admin unlock gifts.
 //
 // Settings (environment variables, all optional):
 //   PORT        port to listen on (default 8080)
@@ -116,10 +116,10 @@ function startMatch(a, b, opt = { ranked: true }) {
 }
 
 function startMatch3(ps, opt = {}) {
-  const m = { id: ++mid, p: ps, np: 3, done: false, ranked: false, room: opt.room || null, rs: opt.room ? opt.room.set : null };
+  const m = { id: ++mid, p: ps, np: ps.length, done: false, ranked: false, room: opt.room || null, rs: opt.room ? opt.room.set : null };
   const nm = ps.map(q => q.n);
   ps.forEach(q => { q.match = m; q.chal = null; unqueue(q); });
-  ps.forEach((q, i) => send(q.c, { t: 'match', np: 3, slot: i, id: m.id, names: nm, opp: nm.filter((_, j) => j != i).join(' & '), ranked: false, rs: m.rs, room: m.room && m.room.code }));
+  ps.forEach((q, i) => send(q.c, { t: 'match', np: ps.length, slot: i, id: m.id, names: nm, opp: nm.filter((_, j) => j != i).join(' & '), ranked: false, rs: m.rs, room: m.room && m.room.code }));
 }
 
 function record(w, l) {
@@ -165,7 +165,7 @@ function leave(p) {
 }
 
 /* ---------- private rooms ---------- */
-const ROOM_MAX = 3;
+const ROOM_MAX = 4;
 const roomState = r => ({ t: 'room', code: r.code, host: r.host.n, players: r.ps.map(q => q.n), set: r.set, game: r.game });
 const rsend = r => { const o = roomState(r); for (const q of r.ps) send(q.c, o); };
 function roomCode() {
@@ -307,9 +307,9 @@ function handle(c, s) {
       break;
     case 'rtc': {
       if (!p.match) return;
-      if (p.match.np === 3 && typeof m.to === 'number') {
+      if (p.match.np >= 3 && typeof m.to === 'number') {
         const q = p.match.p[m.to];
-        if (q && q !== p && q.match === p.match) sendRaw(q.c, encodeFrame(s)); // 3-player: signalling goes to one specific player
+        if (q && q !== p && q.match === p.match) sendRaw(q.c, encodeFrame(s)); // 3-4 players: signalling goes to one specific player
       } else relay(p, s);
       break;
     }
@@ -341,7 +341,7 @@ function handle(c, s) {
       const r = rooms.get(String(m.code || '').toUpperCase().trim());
       if (!r) return send(c, { t: 'err', m: 'No room with code "' + String(m.code || '').slice(0, 8) + '"' });
       if (r === p.room) return rsend(r);
-      if (r.ps.length >= ROOM_MAX) return send(c, { t: 'err', m: 'That room is full (3 players)' });
+      if (r.ps.length >= ROOM_MAX) return send(c, { t: 'err', m: 'That room is full (4 players)' });
       if (r.game) return send(c, { t: 'err', m: 'That room is in a match - try again soon' });
       if (busy(p)) return send(c, { t: 'err', m: 'Finish your match first' });
       roomLeave(p);
@@ -386,7 +386,7 @@ function handle(c, s) {
       r.game = true;
       const ps = [r.host, ...r.ps.filter(q => q !== r.host)]; // the host is slot 0 (picks the stage)
       if (ps.length === 2) startMatch(ps[0], ps[1], { ranked: false, room: r });
-      else startMatch3(ps.slice(0, 3), { room: r });
+      else startMatch3(ps.slice(0, ROOM_MAX), { room: r }); // 3 or 4 players: free-for-all
       rsend(r);
       break;
     }
